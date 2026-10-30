@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Сортировка ФИО по алфавиту с группами</title>
+<style>
+  :root{
+    --bg:#0f172a; --card:#1e293b; --accent:#38bdf8; --text:#e2e8f0;
+    --muted:#94a3b8; --ok:#22c55e; --border:#334155;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Segoe UI',Arial,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding:24px}
+  h1{font-size:22px;margin:0 0 4px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:18px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;max-width:1200px;margin:0 auto}
+  @media(max-width:900px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px}
+  textarea{width:100%;height:280px;resize:vertical;background:#0b1220;color:var(--text);
+    border:1px solid var(--border);border-radius:8px;padding:10px;font-family:Consolas,monospace;font-size:13px}
+  textarea:focus{outline:none;border-color:var(--accent)}
+  .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center}
+  button{cursor:pointer;border:none;border-radius:8px;padding:9px 16px;font-size:14px;font-weight:600;
+    background:var(--accent);color:#04263a;transition:.15s}
+  button:hover{filter:brightness(1.15)}
+  button.ghost{background:transparent;border:1px solid var(--border);color:var(--text);font-weight:400}
+  select,input[type=text]{background:#0b1220;color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:13px}
+  label{font-size:13px;color:var(--muted)}
+  .stats{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+  .chip{background:#0b1220;border:1px solid var(--border);border-radius:20px;padding:6px 14px;font-size:13px}
+  .chip b{color:var(--accent)}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{padding:8px 10px;border-bottom:1px solid var(--border);text-align:left}
+  th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.5px;position:sticky;top:0;background:var(--card)}
+  tr:hover td{background:#243449}
+  .num{color:var(--muted);width:40px}
+  .gtag{display:inline-block;background:rgba(56,189,248,.15);color:var(--accent);border-radius:6px;padding:2px 8px;font-size:12px;font-weight:600}
+  .dup{color:#fbbf24;font-size:12px}
+  .tablewrap{max-height:420px;overflow:auto;border:1px solid var(--border);border-radius:8px}
+  .empty{color:var(--muted);font-style:italic;padding:20px;text-align:center}
+  .msg{font-size:13px;margin-top:8px;min-height:18px}
+  .msg.ok{color:var(--ok)} .msg.err{color:#f87171}
+</style>
+</head>
+<body>
+<h1>📋 Сортировка вставленного текста в таблицу «Фамилия Имя»</h1>
+<div class="sub">Вставьте код/текст из буфера обмена — цифры удаляются, люди сортируются по алфавиту, группы определяются по комментариям, уникальные подсчитываются.</div>
+
+<div class="grid">
+  <div class="card">
+    <textarea id="input" placeholder="Вставьте сюда текст, например:&#10;&#10;1. Иванов Иван — группа А&#10;2. Петров Пётр | Б&#10;3. Сидорова Анна (группа В)&#10;4. ivanov ivan - гр. А&#10;..."></textarea>
+    <div class="row">
+      <button id="btnPaste">📥 Вставить из буфера</button>
+      <button id="btnSort">✨ Отсортировать</button>
+      <button class="ghost" id="btnClear">Очистить</button>
+    </div>
+    <div class="row">
+      <label>Разделитель записи:</label>
+      <select id="splitMode">
+        <option value="auto">Авто (каждая строка / пробелы)</option>
+        <option value="line">Только построчно</option>
+        <option value="space">По двойным пробелам</option>
+      </select>
+      <label><input type="checkbox" id="dedup" checked> объединять дубликаты</label>
+    </div>
+    <div class="msg" id="msg"></div>
+  </div>
+
+  <div class="card">
+    <div class="stats" id="stats"></div>
+    <div class="row" style="margin-bottom:10px">
+      <button class="ghost" id="btnCopy">📄 Копировать таблицу</button>
+      <button class="ghost" id="btnCsv">⬇️ Скачать CSV</button>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th class="num">№</th><th>Фамилия Имя</th><th>Комментарий / Группа</th></tr></thead>
+        <tbody id="tbody"><tr><td colspan="3" class="empty">Результат появится здесь</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+// ===== Логика разбора =====
+const GROUP_KEYS = ['группа','групп','гр\\.?'];
+
+function extractGroup(raw){
+  // Комментарий = всё после цифр/разделителей в конце записи, либо ключевое слово «группа»
+  let g = '';
+  const mKey = raw.match(new RegExp('(?:' + GROUP_KEYS.join('|') + ')\\s*[:№]?\\s*([A-Za-zА-Яа-яЁё0-9\\-]+)','i'));
+  if (mKey) g = mKey[1];
+  else {
+    const mCmt = raw.match(/(?:—|-|\||\/|\(|#|:)\s*([^0-9A-Za-zА-Яа-яЁё]*)\s*([A-Za-zА-Яа-яЁё0-9\-]+)\s*\)?\s*$/);
+    if (mCmt) g = mCmt[2];
+  }
+  return g ? g.toUpperCase() : '—';
+}
+
+const CMT_WORDS = ['группа','гр','групп','коммент','комментарий'];
+
+function cleanName(raw){
+  // отсекаем комментарий с группой ("— группа А", "| Б", "(гр. В)", ", группа Б-3")
+  let s = raw.replace(/(?:[—|\-/(:#,.]\s*(?:группа|гр\.?|групп)?\s*[:№]?\s*[A-Za-zА-Яа-яЁё0-9\-]+\s*\)?)\s*$/i, '');
+  const wordRe = /^[^\W\d_]{2,}$/u;
+  const countWords = t => t.replace(/\d+/g,' ').split(/\s+/).filter(w => wordRe.test(w)).length;
+  // если после усечения осталось < 2 слов — возможно, отрезали часть ФИО; пробуем мягкий вариант
+  if (countWords(s) < 2 && extractGroup(raw) !== '—'){
+    const soft = raw.replace(/(?:[—|\-/(,#]\s*(?:группа|гр\.?|групп)\s*[:№]?\s*[A-Za-zА-Яа-яЁё0-9\-]+)\s*$/i, '');
+    if (countWords(soft) >= 2) s = soft;
+  }
+  s = s
+    .replace(/^\s*\d+[\s.)\-:]*/, '')          // начальный номер "1." "2)"
+    .replace(/\d+/g, ' ')                       // все цифры -> пробел
+    .replace(/[^\p{L}\p{M}\s'-]/gu, ' ')        // не-буквы -> пробел
+    .replace(/\s+/g, ' ').trim();
+  const words = s.split(' ').filter(w => (w.length > 1 || /^[a-zа-я]+$/i.test(w)) && !CMT_WORDS.includes(w.toLowerCase().replace(/\.$/,'')));
+  return words.slice(0, 3).join(' ');
+}
+
+function splitRecords(text, mode){
+  let parts = [];
+  if (mode === 'line'){
+    parts = text.split(/\r?\n/);
+  } else if (mode === 'space'){
+    parts = text.split(/\s{2,}/);
+  } else { // auto: сначала строки, если их мало — разбиваем по длинным пробелам
+    parts = text.split(/\r?\n/).flatMap(l => l.trim().length ? [l] : []);
+    if (parts.length <= 2 && /\s{2,}/.test(text)) parts = text.split(/\s{2,}/);
+  }
+  return parts.map(p => p.trim()).filter(Boolean);
+}
+
+const norm = s => s.toLowerCase().replace(/ё/g,'е').replace(/[^a-zа-я]/gi,'');
+
+function parse(text, mode){
+  const recs = [];
+  for (const raw of splitRecords(text, mode)){
+    const name = cleanName(raw);
+    if (!name) continue;
+    recs.push({ name, group: extractGroup(raw), raw });
+  }
+  return recs;
+}
+
+// ===== Рендер =====
+let lastRows = [];
+
+function render(){
+  const text = document.getElementById('input').value;
+  const mode = document.getElementById('splitMode').value;
+  const dedup = document.getElementById('dedup').checked;
+  const msg = document.getElementById('msg');
+  const tbody = document.getElementById('tbody');
+  const stats = document.getElementById('stats');
+
+  if (!text.trim()){
+    tbody.innerHTML = '<tr><td colspan="3" class="empty">Результат появится здесь</td></tr>';
+    stats.innerHTML = ''; msg.textContent=''; lastRows=[]; return;
+  }
+
+  let recs = parse(text, mode);
+  if (!recs.length){ msg.className='msg err'; msg.textContent='Не удалось распознать ни одной записи.'; return; }
+
+  // объединение дубликатов по нормализованному имени
+  const map = new Map();
+  for (const r of recs){
+    const k = norm(r.name);
+    if (map.has(k)){
+      const e = map.get(k);
+      e.count++;
+      if (e.group === '—' && r.group !== '—') e.group = r.group;
+    } else map.set(k, {...r, count:1});
+  }
+  let rows = dedup ? [...map.values()] : recs.map(r=>({...r,count:1}));
+  rows.sort((a,b)=> a.name.localeCompare(b.name,'ru',{sensitivity:'base'}));
+
+  lastRows = rows;
+  tbody.innerHTML = rows.map((r,i)=>`<tr>
+      <td class="num">${i+1}</td>
+      <td>${esc(r.name)}${r.count>1?` <span class="dup">×${r.count}</span>`:''}</td>
+      <td><span class="gtag">${esc(r.group)}</span></td>
+    </tr>`).join('');
+
+  const uniq = new Set(recs.map(r=>norm(r.name))).size;
+  const groups = {};
+  rows.forEach(r=>groups[r.group]=(groups[r.group]||0)+ (r.count));
+  stats.innerHTML =
+    `<span class="chip">Записей: <b>${recs.length}</b></span>` +
+    `<span class="chip">Уникальных людей: <b>${uniq}</b></span>` +
+    Object.entries(groups).sort().map(([g,c])=>`<span class="chip">Группа <b>${esc(g)}</b>: ${c}</span>`).join('');
+  msg.className='msg ok'; msg.textContent=`Готово: ${rows.length} строк, ${uniq} уникальных.`;
+}
+
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+
+// ===== Кнопки =====
+document.getElementById('btnSort').onclick = render;
+document.getElementById('input').addEventListener('input', render);
+document.getElementById('splitMode').onchange = render;
+document.getElementById('dedup').onchange = render;
+document.getElementById('btnClear').onclick = ()=>{document.getElementById('input').value='';render();};
+
+document.getElementById('btnPaste').onclick = async ()=>{
+  try{
+    document.getElementById('input').value = await navigator.clipboard.readText();
+    render();
+  }catch(e){
+    document.getElementById('msg').className='msg err';
+    document.getElementById('msg').textContent='Буфер обмена недоступен из браузера — вставьте вручную Ctrl+V.';
+  }
+};
+
+document.getElementById('btnCopy').onclick = async ()=>{
+  if(!lastRows.length) return;
+  const txt = lastRows.map((r,i)=>`${i+1}. ${r.name}${r.group!=='—'?' — '+r.group:''}`).join('\n');
+  try{ await navigator.clipboard.writeText(txt); flash('Таблица скопирована'); }catch(e){ flash('Не удалось скопировать'); }
+};
+
+document.getElementById('btnCsv').onclick = ()=>{
+  if(!lastRows.length) return;
+  const csv = '\uFEFF№;Фамилия Имя;Группа\n' + lastRows.map((r,i)=>`${i+1};${r.name};${r.group}`).join('\n');
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));
+  a.download='sorted.csv'; a.click();
+};
+
+function flash(t){const m=document.getElementById('msg');m.className='msg ok';m.textContent=t;}
+</script>
+</body>
+</html>
