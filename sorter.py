@@ -29,10 +29,92 @@ def extract_group(raw: str, fallback: str = "—") -> str:
     m = re.search(r"(?:группа|групп|гр\.?)\s*[:№]?\s*([A-Za-zА-Яа-яЁё0-9\-]+)", raw, re.I)
     if m:
         return m.group(1).upper()
+    # «... N класс» / «N ... класс»: название группы/класса внутри строки
+    m = re.search(r"^(?:(\d+)\s+)?(.+?)\s+(\d+[-‑]?)?\s*класс", raw.strip(), re.I)
+    if m:
+        num, rest, cls = m.group(1), (m.group(2) or "").strip(), (m.group(3) or "").strip()
+        parts = [p for p in (num, rest, f"{cls}класс" if cls else "") if p]
+        return " ".join(parts).rstrip(".")
     return fallback
 
 
 CMT_WORDS = {"группа", "гр", "групп", "коммент", "комментарий"}
+
+# Стоп-слова: не являются частью ФИО (названия объединений, классов и т.п.)
+STOP_WORDS = {
+    "группа", "групп", "группы", "гр", "класс", "класса", "классов", "занятие", "занятий",
+    "секция", "кружок", "студия", "театральная", "робототехника", "робототехники",
+    "коммент", "комментарий", "ученик", "ученица", "школа", "колледж", "лицей", "гимназия",
+    "спасибо", "итого", "всего", "斐",
+}
+# Слова, обозначающие учебную группу/класс (используются для распознавания комментированных строк)
+CLASS_KEYS = ("класс", "группа", "гр.", "гр", "групп", "секция", "кружок", "школа")
+
+
+def is_stop_word(w: str) -> bool:
+    t = w.lower().strip(".")
+    return t in STOP_WORDS or norm(t) in {norm(x) for x in STOP_WORDS}
+
+
+def looks_like_person(name: str) -> bool:
+    """Проверка «отсутствие отчества»: запись — человек, если это Фамилия Имя (2 слова)
+    или Фамилия Имя Отчество (3 слова). Меньше 2 слов или больше 3 — не ФИО."""
+    words = name.split()
+    if len(words) < 2:
+        return False
+    if any(is_stop_word(w) for w in words):
+        return False
+    return len(words) <= 3
+
+
+def _is_initial(tok: str) -> bool:
+    """Буква или буква с точкой: 'И', 'И.'"""
+    return bool(re.fullmatch(r"[A-Za-zА-Яа-яЁё]\.?", tok))
+
+
+def initials_to_full(letters: list[str]) -> str:
+    """Фамилия И. О. -> Фамилия ИО (для сопоставления с полной записью без точек)."""
+    return "".join(norm(l) for l in letters)
+
+
+def person_from_text(text: str) -> tuple[str, str]:
+    """Извлекает ФИО из фрагмента текста (без метки комментария).
+    Возвращает ('ФИО', 'метка': '' | 'init' | 'short')."""
+    s = re.sub(r"^\s*\d+[\s.)\-:]*", "", text)     # начальный номер "1." / "2)"
+    s = re.sub(r"\d+", " ", s)                      # все цифры -> пробел
+    s = "".join(ch if (unicodedata.category(ch).startswith("L") or ch in " '.-") else " " for ch in s)
+    toks = [t for t in s.split() if t]
+    words = [t for t in toks if norm(t) and not is_stop_word(t)]
+    if not words:
+        return "", ""
+    # Вариант «Фамилия И. О.» (инициалы с точками)
+    if len(words) >= 3 and _is_initial(words[1]) and _is_initial(words[2]):
+        return f"{words[0]} {words[1].rstrip('.')} {words[2].rstrip('.')}", "init"
+    if len(words) >= 3 and _is_initial(words[1]):
+        return f"{words[0]} {words[1].rstrip('.')}", "init"
+    return " ".join(words[:3]), ("short" if len(words) == 2 else "")
+
+
+def parse_comment_line(text: str) -> str | None:
+    """Распознаёт строку-комментарий вида «1 Робототехника 2 класс.» / «2 Ш2»
+    (номер + название группы/класса, без ФИО). Возвращает текст комментария или None."""
+    t = text.strip()
+    m = re.match(r"^(\d+)\s+(?!\d)(.+)$", t)
+    if not m:
+        return None
+    rest = m.group(2).strip().rstrip(".«»\"')").strip()
+    if not rest:
+        return None
+    low = rest.lower()
+    has_class_kw = any(k in low for k in CLASS_KEYS)
+    tokens = rest.split()
+    # сокращённый вариант без ключ. слова: «Ш2», «Робототехника-2» — нет длинных ФИО-слов
+    long_words = [w for w in tokens if len(w) >= 4 and not is_stop_word(w)]
+    if has_class_kw:
+        return rest
+    if not long_words and len(tokens) <= 3:
+        return rest
+    return None
 
 
 def _name_words(s: str) -> str:
@@ -46,11 +128,12 @@ def _name_words(s: str) -> str:
 
 
 def clean_name(raw: str) -> str:
-    """Убирает цифры, номера строк и комментарий о группе, оставляет Фамилию Имя."""
+    """Убирает цифры, номера строк и комментарий о группе, оставляет Фамилию Имя (или ФИО)."""
     # маркер колоночного комментария: ФИО | "1 Театральная студия" — отсечь целиком
     s = re.sub(r"\s*[|—]\s*\"[^\"]*\"\s*$", "", raw)
     if s != raw:
-        return _name_words(s)
+        nm, _ = person_from_text(s)
+        return nm or _name_words(s)
     # отсекаем комментарий с группой ("— группа А", "| Б", "(гр. В)", ", группа Б-3")
     s = re.sub(r"(?:[—|\-/(:#,.]\s*(?:группа|гр\.?|групп)?\s*[:№]?\s*[A-Za-zА-Яа-яЁё0-9\-]+\s*\)?)\s*$", "", raw, flags=re.I)
     if s == raw:  # ничего не отсечено — оставляем как есть
@@ -63,13 +146,8 @@ def clean_name(raw: str) -> str:
         soft = re.sub(r"(?:[—|\-/(,#]\s*(?:группа|гр\.?|групп)\s*[:№]?\s*[A-Za-zА-Яа-яЁё0-9\-]+)\s*$", "", raw, flags=re.I)
         if len([w for w in re.sub(r"\d+", " ", soft).split() if re.match(r"[^\W\d_]{2,}$", w, re.U)]) >= 2:
             trimmed = soft
-    s = trimmed
-    s = re.sub(r"^\s*\d+[\s.)\-:]*", "", s)      # начальный номер "1." / "2)"
-    s = re.sub(r"\d+", " ", s)                    # все цифры -> пробел
-    s = "".join(ch if (unicodedata.category(ch).startswith("L") or ch in " '-") else " " for ch in s)
-    words = [w for w in s.split()
-             if (len(w) > 1 or w.isalpha()) and w.lower().rstrip(".") not in CMT_WORDS]
-    return " ".join(words[:3])
+    nm, _ = person_from_text(trimmed)
+    return nm or _name_words(trimmed)
 
 
 def split_records(text: str) -> list[str]:
@@ -104,6 +182,11 @@ def has_tabs(text: str) -> bool:
     return "\t" in text
 
 
+def is_two_column_text(text: str) -> bool:
+    """Текст — двухколоночная таблица: как минимум две непустые строки содержат табы."""
+    return sum(1 for l in text.splitlines() if "\t" in l and l.strip()) >= 2
+
+
 def grid_from_text(text: str, sep: str):
     lines = text.splitlines()
     n_cols = max((len(re.split(sep, l)) for l in lines), default=1)
@@ -116,6 +199,8 @@ def grid_from_text(text: str, sep: str):
 def parse_columns(text: str, sep: str = "\t"):
     """Разбор многоколоночного списка (как из Excel/таблицы):
     заголовки «Группа N ...» задают группу для ФИО своего столбца ниже.
+    Строка-комментарий («1 Робототехника 2 класс.» / «2 Ш2») склеивается с ФИО
+    из следующей строки того же столбца; комментарии подряд накапливаются.
     Возвращает список сырых записей 'ФИО | "<группа>"'.
     """
     grid = grid_from_text(text, sep)
@@ -123,7 +208,16 @@ def parse_columns(text: str, sep: str = "\t"):
         return []
 
     col_groups: dict[int, str] = {}
+    pending_cmt: dict[int, list[str]] = {}
     records: list[str] = []
+
+    def push(nm: str, g: str):
+        records.append(nm if g == "—" else f'{nm} | "{g}"')
+
+    def apply_pending(i: int, nm: str):
+        lst = pending_cmt.pop(i, [])
+        push(nm, " ".join(lst).strip() or col_groups.get(i, "—"))
+
     for cells in grid:
         # если строка — только заголовки групп, сопоставляем их со столбцами
         header_idx = [i for i, c in enumerate(cells) if is_header(c)]
@@ -137,19 +231,128 @@ def parse_columns(text: str, sep: str = "\t"):
             c = cell.strip()
             if not c or is_header(c):
                 continue
-            names = re.findall(rf"{NAME_RE}(?:\s+{NAME_RE})+", c)
-            if not names:
+            names = extract_names_from_cell(c)
+            if names:
+                for nm in names:
+                    apply_pending(i, nm)
                 continue
-            g = col_groups.get(i, "—")
-            for nm in names:
-                # кавычки-маркер, чтобы clean_name не вырезал слова из названия группы
-                records.append(nm if g == "—" else f'{nm} | "{g}"')
+            # людей нет — возможно это комментарий «1 Робототехника 2 класс.» / «2 Ш2»
+            cmt = parse_comment_line(c)
+            if cmt is not None:
+                pending_cmt.setdefault(i, []).append(cmt)
+                continue
+            # одиночное имя («Фамилия Имя») тоже считаем человеком
+            nm, _ = person_from_text(c)
+            if nm and looks_like_person(nm):
+                apply_pending(i, nm)
     return records
 
 
 def norm(s: str) -> str:
     s = s.lower().replace("ё", "е")
     return re.sub(r"[^a-zа-я]", "", s)
+
+
+# ---------- Сопоставление людей (без отчества / с отчеством / инициалы) ----------
+def _is_person_word(w: str) -> bool:
+    return len(w) >= 2 and w[0].isalpha() and not is_stop_word(w)
+
+
+def _all_init(toks: list[str]) -> bool:
+    return bool(toks) and all(re.fullmatch(r"[A-Za-zА-Яа-яЁё]\.?", t) for t in toks)
+
+
+def name_variants(name: str):
+    """Возвращает ('фамилия', 'имя', 'отчество' | None, 'инициалы' | None)."""
+    parts = [p for p in name.split() if p]
+    if not parts:
+        return None
+    fam = norm(parts[0])
+    if len(parts) == 1:
+        return fam, "", None, None
+    if _all_init(parts[1:]):
+        return fam, "", None, initials_to_full(parts[1:])
+    inm = norm(parts[1])
+    otc = norm(parts[2]) if len(parts) >= 3 else None
+    return fam, inm, otc, None
+
+
+def match_key(v) -> tuple:
+    """Ключ для объединения одного и того же человека в разных написаниях."""
+    fam, inm, otc, ini = v
+    if ini is not None:
+        return ("i", fam, ini[:1])
+    return ("n", fam, inm)
+
+
+def keys_compatible(a: tuple, b: tuple) -> bool:
+    """Совместимы ли два ключа (один и тот же человек)."""
+    if a[0] == "n" and b[0] == "n":
+        return a[1] == b[1] and a[2] == b[2]
+    if a[0] == "i" and b[0] == "i":
+        return a[1] == b[1] and (a[2] == b[2] or a[2] == "" or b[2] == "")
+    ia, na = (a, b) if a[0] == "i" else (b, a)   # ia — инициалы, na — полное имя
+    if ia[1] != na[1]:
+        return False
+    ini, inm = ia[2], na[2]
+    if not ini:          # только фамилия + первая буква
+        return True
+    return ini.startswith(inm[:1]) or inm.startswith(ini[:1])
+
+
+def better_name(cur: str, new: str) -> str:
+    """Оставляет более полное написание ФИО (с отчеством вместо «Фамилия Имя»)."""
+    cp, np_ = cur.split(), new.split()
+    if len(np_) > len(cp):
+        return new
+    if len(np_) == len(cp):
+        cini = sum(1 for w in cp[1:] if re.fullmatch(r"[A-Za-zА-Яа-яЁё]\.?", w))
+        nini = sum(1 for w in np_[1:] if re.fullmatch(r"[A-Za-zА-Яа-яЁё]\.?", w))
+        if nini < cini:
+            return new
+    return cur
+
+
+def extract_names_from_cell(cell: str) -> list[str]:
+    """Достаёт ФИО из ячейки/строки; пустой список — если людей там нет."""
+    found = re.findall(rf"{NAME_RE}(?:\s+{NAME_RE}){{1,2}}", cell)
+    out = []
+    for nm in found:
+        words = nm.split()
+        if 2 <= len(words) <= 3 and all(_is_person_word(w) for w in words):
+            out.append(nm)
+    if out:
+        return out
+    # одиночное «Фамилия Имя» (в т.ч. строчными буквами)
+    nm, _ = person_from_text(cell)
+    return [nm] if nm and looks_like_person(nm) else []
+
+
+def merge_comment_records(parts: list[str]) -> list[str]:
+    """Склеивает строку-комментарий («1 Робототехника 2 класс.», «2 Ш2») со СЛЕДУЮЩЕЙ
+    строкой-ФИО; несколько комментариев подряд накапливаются и объединяются в один."""
+    merged: list[str] = []
+    pending: list[str] = []
+    for p in parts:
+        cmt = parse_comment_line(p)
+        nm, _ = (("", "") if cmt is not None else person_from_text(p))
+        if cmt is not None and not (nm and looks_like_person(nm)):
+            pending.append(cmt)          # комментарий ждёт своё ФИО
+            continue
+        if nm and looks_like_person(nm):
+            if pending:
+                merged.append(f'{nm} | "{" ".join(pending)}"')
+                pending = []
+            else:
+                merged.append(p)
+        elif pending:
+            merged.append(f'— | "{" ".join(pending)}"')   # хвост без ФИО — будет отброшен
+            pending = []
+        else:
+            merged.append(p)
+    if pending:
+        merged.append(f'— | "{" ".join(pending)}"')
+    return merged
 
 
 def align_columns(text: str) -> str:
@@ -215,29 +418,41 @@ def align_columns(text: str) -> str:
 def parse(text: str, dedup: bool = True):
     """Возвращает (rows, total_records, unique_count, groups_counter)."""
     recs = []
-    col_text = text if has_tabs(text) else align_columns(text)
-    col_records = parse_columns(col_text) if col_text else []
-    raw_list = col_records if col_records else split_records(text)
+    # 1) колоночный разбор: табы (две колонки) либо выравнивание по заголовкам «Группа N»
+    col_records = parse_columns(text) if is_two_column_text(text) else []
+    if not col_records and has_tabs(text):
+        col_records = parse_columns(align_columns(text))
+    raw_list = col_records
+    if not raw_list:
+        # 2) строковый режим: комментарии («1 Робототехника 2 класс.», «2 Ш2») склеиваем со следующими ФИО
+        raw_list = merge_comment_records(split_records(text))
     for raw in raw_list:
         name = clean_name(raw)
-        if not name:
-            continue
+        if not name or not looks_like_person(name):
+            continue   # строка-комментарий или мусор — не человек
         recs.append({"name": name, "group": extract_group(raw)})
 
-    uniq = len({norm(r["name"]) for r in recs})
+    uniq = len({match_key(name_variants(r["name"])) for r in recs})
 
     if dedup:
-        seen, rows = {}, []
+        rows = []
         for r in recs:
-            k = norm(r["name"])
-            if k in seen:
-                e = rows[seen[k]]
-                e["count"] += 1
-                if e["group"] == "—" and r["group"] != "—":
-                    e["group"] = r["group"]
+            k = match_key(name_variants(r["name"]))
+            target = None
+            for i, e in enumerate(rows):
+                if keys_compatible(k, e["key"]):
+                    target = e
+                    break
+            if target is not None:
+                target["count"] += 1
+                target["name"] = better_name(target["name"], r["name"])
+                if target["group"] == "—" and r["group"] != "—":
+                    target["group"] = r["group"]
             else:
-                seen[k] = len(rows)
-                rows.append({**r, "count": 1})
+                rows.append({"name": r["name"], "group": r["group"],
+                             "count": 1, "key": k})
+        for e in rows:
+            e.pop("key", None)
     else:
         rows = [{**r, "count": 1} for r in recs]
 
