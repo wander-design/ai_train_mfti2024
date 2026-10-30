@@ -15,23 +15,42 @@ import unicodedata
 GROUP_KEYS = ("группа", "гр.", "гр", "групп")
 
 
-def extract_group(raw: str) -> str:
-    """Определяет группу по комментарию в строке."""
+def extract_group(raw: str, fallback: str = "—") -> str:
+    """Определяет группу по комментарию в строке; если не найдена — fallback (заголовок столбца)."""
+    # маркер колоночного комментария: ФИО | "1 Театральная студия" — имя группы как есть
+    m = re.search(r"[|—]\s*\"([^\"]*)\"\s*$", raw)
+    if m:
+        return m.group(1)
+    # явный комментарий после разделителя: "| А", "— группа Б", "(гр. В)"
+    m = re.search(r"[—|\-/:(]\s*(?:группа|групп|гр\.?)?\s*[:№]?\s*([A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9\-]*)\s*\)?\s*$", raw)
+    if m:
+        return m.group(1).upper()
+    # ключевое слово где угодно в строке: "группа А"
     m = re.search(r"(?:группа|групп|гр\.?)\s*[:№]?\s*([A-Za-zА-Яа-яЁё0-9\-]+)", raw, re.I)
     if m:
         return m.group(1).upper()
-    # комментарий после разделителя в конце записи: "— А", "| Б", "(В)"
-    m = re.search(r"[—|\-/(:#]\s*[^\s0-9A-Za-zА-Яа-яЁё]*\s*([A-Za-zА-Яа-яЁё0-9\-]+)\s*\)?\s*$", raw)
-    if m:
-        return m.group(1).upper()
-    return "—"
+    return fallback
 
 
 CMT_WORDS = {"группа", "гр", "групп", "коммент", "комментарий"}
 
 
+def _name_words(s: str) -> str:
+    """Оставляет только слова-ФИО (буквы, дефис, апостроф), отрезая цифры и служебное."""
+    s = re.sub(r"^\s*\d+[\s.)\-:]*", "", s)   # начальный номер "1." / "2)"
+    s = re.sub(r"\d+", " ", s)                 # все цифры -> пробел
+    s = "".join(ch if (unicodedata.category(ch).startswith("L") or ch in " '-") else " " for ch in s)
+    words = [w for w in s.split()
+             if (len(w) > 1 or w.isalpha()) and w.lower().rstrip(".") not in CMT_WORDS]
+    return " ".join(words[:3])
+
+
 def clean_name(raw: str) -> str:
     """Убирает цифры, номера строк и комментарий о группе, оставляет Фамилию Имя."""
+    # маркер колоночного комментария: ФИО | "1 Театральная студия" — отсечь целиком
+    s = re.sub(r"\s*[|—]\s*\"[^\"]*\"\s*$", "", raw)
+    if s != raw:
+        return _name_words(s)
     # отсекаем комментарий с группой ("— группа А", "| Б", "(гр. В)", ", группа Б-3")
     s = re.sub(r"(?:[—|\-/(:#,.]\s*(?:группа|гр\.?|групп)?\s*[:№]?\s*[A-Za-zА-Яа-яЁё0-9\-]+\s*\)?)\s*$", "", raw, flags=re.I)
     if s == raw:  # ничего не отсечено — оставляем как есть
@@ -60,15 +79,146 @@ def split_records(text: str) -> list[str]:
     return parts
 
 
+NAME_RE = r"[A-ЯЁa-яё][A-ЯЁa-яё'\-]+"
+
+
+def is_header(line: str) -> bool:
+    """Заголовок вида «Группа 1 Театральная Студия»."""
+    return bool(re.match(r"^(?:группа|гр\.?)\s*\d+", line.strip(), re.I))
+
+
+def header_group_name(line: str) -> str:
+    """Из заголовка делает имя группы: «Группа 1 Театральная Студия» -> «1 Театральная студия»."""
+    s = re.sub(r"^(?:группа|гр\.?)\s*", "", line.strip(), flags=re.I)
+    words = s.split(None, 1)
+    if not words:
+        return "—"
+    num = words[0]
+    rest = words[1].strip() if len(words) > 1 else ""
+    if rest:
+        rest = rest.lower().capitalize()  # «Театральная Студия» -> «Театральная студия»
+    return f"{num} {rest}".strip()
+
+
+def has_tabs(text: str) -> bool:
+    return "\t" in text
+
+
+def grid_from_text(text: str, sep: str):
+    lines = text.splitlines()
+    n_cols = max((len(re.split(sep, l)) for l in lines), default=1)
+    if n_cols < 2:
+        return None
+    grid = [re.split(sep, l) for l in lines]
+    return [c + [""] * (n_cols - len(c)) for c in grid]
+
+
+def parse_columns(text: str, sep: str = "\t"):
+    """Разбор многоколоночного списка (как из Excel/таблицы):
+    заголовки «Группа N ...» задают группу для ФИО своего столбца ниже.
+    Возвращает список сырых записей 'ФИО | "<группа>"'.
+    """
+    grid = grid_from_text(text, sep)
+    if not grid:
+        return []
+
+    col_groups: dict[int, str] = {}
+    records: list[str] = []
+    for cells in grid:
+        # если строка — только заголовки групп, сопоставляем их со столбцами
+        header_idx = [i for i, c in enumerate(cells) if is_header(c)]
+        if header_idx and all(
+            (not c.strip()) or is_header(c) or re.fullmatch(r"\d+", c.strip()) for c in cells
+        ):
+            for i in header_idx:
+                col_groups[i] = header_group_name(cells[i])
+            continue
+        for i, cell in enumerate(cells):
+            c = cell.strip()
+            if not c or is_header(c):
+                continue
+            names = re.findall(rf"{NAME_RE}(?:\s+{NAME_RE})+", c)
+            if not names:
+                continue
+            g = col_groups.get(i, "—")
+            for nm in names:
+                # кавычки-маркер, чтобы clean_name не вырезал слова из названия группы
+                records.append(nm if g == "—" else f'{nm} | "{g}"')
+    return records
+
+
 def norm(s: str) -> str:
     s = s.lower().replace("ё", "е")
     return re.sub(r"[^a-zа-я]", "", s)
 
 
+def align_columns(text: str) -> str:
+    """Если табов нет, но есть заголовки «Группа N» в нескольких колонках —
+    восстанавливаем сетку по позициям символов (моноширинная раскладка)."""
+    lines = text.splitlines()
+    hdr_i = next((i for i, l in enumerate(lines) if re.search(r"(?:Группа|Гр\.?)\s*\d", l)), None)
+    if hdr_i is None:
+        return ""
+
+    def gap_starts(line: str):
+        """Позиции первых слов после пробельных разрывов >=3."""
+        res = []
+        for m in re.finditer(r" {3,}\S+", line):
+            res.append(m.end())  # позиция сразу после разрыва = начало следующего фрагмента
+        return res
+
+    # границы из строки заголовков: 0 + начала фрагментов после длинных разрывов
+    bounds = [0] + gap_starts(lines[hdr_i])
+    data_idx = [i for i, l in enumerate(lines)
+                if i != hdr_i and l.strip() and not re.search(r"(?:Группа|Гр\.?)\s*\d", l)]
+
+    def add_gaps(bs, line):
+        out = list(bs)
+        for p in gap_starts(line):
+            if all(abs(p - b) > 5 for b in out):
+                out.append(p)
+        return sorted(set(out))
+
+    # если границ мало — расширяем их по разрывам данных (кластеризация близких позиций)
+    if len(bounds) < 3:
+        pts = sorted({p for i in data_idx for p in gap_starts(lines[i])})
+        clusters: list[list[int]] = []
+        for p in pts:
+            if clusters and p - clusters[-1][-1] <= 6:
+                clusters[-1].append(p)
+            else:
+                clusters.append([p])
+        strong = [sorted(c)[len(c) // 2] for c in clusters if len(c) >= 2]
+        for p in strong:
+            if all(abs(p - b) > 5 for b in bounds):
+                bounds.append(p)
+        bounds = sorted(set(bounds))
+
+    # достраиваем границы по данным (разрывы, не попавшие ни в одну колонку)
+    col_bounds = [list(bounds) for _ in range(len(lines))]
+    for i in data_idx:
+        col_bounds[i] = add_gaps(bounds, lines[i])
+
+    out_lines = []
+    for i, l in enumerate(lines):
+        bs = col_bounds[i]
+        cells = []
+        for j, b in enumerate(bs):
+            end = bs[j + 1] if j + 1 < len(bs) else len(l)
+            cells.append(l[b:end].strip() if b < len(l) else "")
+        out_lines.append("\t".join(cells))
+    # оставляем только если получилась таблица с ФИО
+    probe = parse_columns("\n".join(out_lines))
+    return "\n".join(out_lines) if probe else ""
+
+
 def parse(text: str, dedup: bool = True):
     """Возвращает (rows, total_records, unique_count, groups_counter)."""
     recs = []
-    for raw in split_records(text):
+    col_text = text if has_tabs(text) else align_columns(text)
+    col_records = parse_columns(col_text) if col_text else []
+    raw_list = col_records if col_records else split_records(text)
+    for raw in raw_list:
         name = clean_name(raw)
         if not name:
             continue

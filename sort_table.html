@@ -86,20 +86,35 @@
 const GROUP_KEYS = ['группа','групп','гр\\.?'];
 
 function extractGroup(raw){
-  // Комментарий = всё после цифр/разделителей в конце записи, либо ключевое слово «группа»
   let g = '';
+  // маркер колоночного комментария: ФИО | "1 Театральная студия" — имя группы как есть
+  const mQuoted = raw.match(/[|—]\s*"([^"]*)"\s*$/);
+  if (mQuoted) return mQuoted[1];
   const mKey = raw.match(new RegExp('(?:' + GROUP_KEYS.join('|') + ')\\s*[:№]?\\s*([A-Za-zА-Яа-яЁё0-9\\-]+)','i'));
   if (mKey) g = mKey[1];
   else {
-    const mCmt = raw.match(/(?:—|-|\||\/|\(|#|:)\s*([^0-9A-Za-zА-Яа-яЁё]*)\s*([A-Za-zА-Яа-яЁё0-9\-]+)\s*\)?\s*$/);
-    if (mCmt) g = mCmt[2];
+    const mCmt = raw.match(/(?:—|\||\/|-|\(|:)\s*(?:группа|групп|гр\.?)?\s*[:№]?\s*([A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9\-]*)\s*\)?\s*$/);
+    if (mCmt) g = mCmt[1];
   }
   return g ? g.toUpperCase() : '—';
 }
 
 const CMT_WORDS = ['группа','гр','групп','коммент','комментарий'];
 
+function nameWords(s){
+  s = s
+    .replace(/^\s*\d+[\s.)\-:]*/, '')          // начальный номер "1." "2)"
+    .replace(/\d+/g, ' ')                       // все цифры -> пробел
+    .replace(/[^\p{L}\p{M}\s'-]/gu, ' ')        // не-буквы -> пробел
+    .replace(/\s+/g, ' ').trim();
+  const words = s.split(' ').filter(w => (w.length > 1 || /^[a-zа-я]+$/i.test(w)) && !CMT_WORDS.includes(w.toLowerCase().replace(/\.$/,'')));
+  return words.slice(0, 3).join(' ');
+}
+
 function cleanName(raw){
+  // маркер колоночного комментария: ФИО | "1 Театральная студия" — отсечь целиком
+  const q = raw.match(/\s*[|—]\s*"[^"]*"\s*$/);
+  if (q) return nameWords(raw.slice(0, q.index));
   // отсекаем комментарий с группой ("— группа А", "| Б", "(гр. В)", ", группа Б-3")
   let s = raw.replace(/(?:[—|\-/(:#,.]\s*(?:группа|гр\.?|групп)?\s*[:№]?\s*[A-Za-zА-Яа-яЁё0-9\-]+\s*\)?)\s*$/i, '');
   const wordRe = /^[^\W\d_]{2,}$/u;
@@ -109,13 +124,7 @@ function cleanName(raw){
     const soft = raw.replace(/(?:[—|\-/(,#]\s*(?:группа|гр\.?|групп)\s*[:№]?\s*[A-Za-zА-Яа-яЁё0-9\-]+)\s*$/i, '');
     if (countWords(soft) >= 2) s = soft;
   }
-  s = s
-    .replace(/^\s*\d+[\s.)\-:]*/, '')          // начальный номер "1." "2)"
-    .replace(/\d+/g, ' ')                       // все цифры -> пробел
-    .replace(/[^\p{L}\p{M}\s'-]/gu, ' ')        // не-буквы -> пробел
-    .replace(/\s+/g, ' ').trim();
-  const words = s.split(' ').filter(w => (w.length > 1 || /^[a-zа-я]+$/i.test(w)) && !CMT_WORDS.includes(w.toLowerCase().replace(/\.$/,'')));
-  return words.slice(0, 3).join(' ');
+  return nameWords(s);
 }
 
 function splitRecords(text, mode){
@@ -133,9 +142,52 @@ function splitRecords(text, mode){
 
 const norm = s => s.toLowerCase().replace(/ё/g,'е').replace(/[^a-zа-я]/gi,'');
 
+// ===== Разбор колоночного списка (как из Excel): заголовки «Группа N ...» задают группу столбца =====
+const NAME_RE = "[A-ЯЁa-яё][A-ЯЁa-яё'\\-]+";
+const isHeader = l => /^(?:группа|гр\.?)\s*\d+/i.test(l.trim());
+function headerGroupName(line){
+  const s = line.trim().replace(/^(?:группа|гр\.?)\s*/i, '');
+  const words = s.split(/\s+/);
+  if (!words.length || !words[0]) return '—';
+  const num = words[0];
+  let rest = words.slice(1).join(' ');
+  if (rest) rest = rest.charAt(0).toUpperCase() + rest.slice(1).toLowerCase();
+  return (num + ' ' + rest).trim();
+}
+function parseColumns(text){
+  const lines = text.split(/\r?\n/);
+  let nCols = 1;
+  for (const l of lines) nCols = Math.max(nCols, l.split('\t').length);
+  if (nCols < 2) return [];
+  const grid = lines.map(l => { const c = l.split('\t'); while (c.length < nCols) c.push(''); return c; });
+  const colGroups = {}, records = [];
+  const nameRe = new RegExp(NAME_RE + '(?:\\s+' + NAME_RE + ')+', 'g');
+  for (const cells of grid){
+    const headerIdx = [];
+    cells.forEach((c,i) => { if (isHeader(c)) headerIdx.push(i); });
+    const onlyMeta = cells.every(c => !c.trim() || isHeader(c) || /^\d+$/.test(c.trim()));
+    if (headerIdx.length && onlyMeta){
+      for (const i of headerIdx) colGroups[i] = headerGroupName(cells[i]);
+      continue;
+    }
+    cells.forEach((cell, i) => {
+      const c = cell.trim();
+      if (!c || isHeader(c)) return;
+      const names = c.match(nameRe);
+      if (!names) return;
+      const g = colGroups[i] || '—';
+      for (const nm of names)
+        records.push(g === '—' ? nm : nm + ' | "' + g + '"');
+    });
+  }
+  return records;
+}
+
 function parse(text, mode){
+  const colRecs = parseColumns(text);
+  const rawList = colRecs.length ? colRecs : splitRecords(text, mode);
   const recs = [];
-  for (const raw of splitRecords(text, mode)){
+  for (const raw of rawList){
     const name = cleanName(raw);
     if (!name) continue;
     recs.push({ name, group: extractGroup(raw), raw });
